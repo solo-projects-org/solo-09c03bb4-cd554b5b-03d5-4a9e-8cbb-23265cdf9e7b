@@ -1,0 +1,140 @@
+{% extends "base.html" %}
+{% block title %}超温核算 - 冷链记录仪校时平台{% endblock %}
+{% block content %}
+<h2>超温暴露核算（度·分钟）</h2>
+
+<div class="card">
+  <form method="get" action="/exposure">
+    <p><label>开始 (UTC)</label>
+       <input type="text" name="start" size="24" placeholder="2026-01-01 08:00:00" required
+              value="{{ form.start }}">
+       <label>结束 (UTC)</label>
+       <input type="text" name="end" size="24" placeholder="2026-01-03 08:00:00" required
+              value="{{ form.end }}"></p>
+    <p><label>温度上限 (°C)</label>
+       <input type="text" name="limit" size="10" placeholder="5" required
+              value="{{ form.limit }}">
+       <label>允许剂量 (°C·min)</label>
+       <input type="text" name="allowed" size="10" placeholder="30" required
+              value="{{ form.allowed }}">
+       <label>相邻读数最大间隔 (分钟)</label>
+       <input type="text" name="max_gap" size="10" placeholder="10" required
+              value="{{ form.max_gap }}"></p>
+    <p><button type="submit">核算</button></p>
+  </form>
+  <p class="hint">
+    使用同一已发布校时版本中夹住时段首尾的读数，按相邻点线性插值累计超限面积，跨日连续计算。<br>
+    首尾缺少可信读数、相邻间隔超限或同一 UTC 出现异温读数时返回「无法判定」，<b>不得以零剂量放行</b>。<br>
+    时间一律按 UTC，格式如 <span class="mono">2026-01-01 08:00:00</span> 或
+    <span class="mono">2026-01-01T08:00:00Z</span>。
+  </p>
+</div>
+
+{% if error %}<div class="msg err">{{ error }}</div>{% endif %}
+
+{% if result %}
+<div class="card">
+  <h3>结论</h3>
+  {% if result.conclusion == 'release' %}
+  <div class="msg ok"><b>可放行</b>：超温剂量 {{ "%.3f"|format(result.dose) }} °C·min
+       ≤ 允许 {{ result.allowed }} °C·min（校时版本 v{{ result.calc_version }}）。</div>
+  {% elif result.conclusion == 'quarantine' %}
+  <div class="msg err"><b>建议隔离</b>：超温剂量 {{ "%.3f"|format(result.dose) }} °C·min
+       &gt; 允许 {{ result.allowed }} °C·min（校时版本 v{{ result.calc_version }}）。</div>
+  {% elif result.conclusion == 'undetermined' %}
+  <div class="msg err"><b>无法判定</b>：不得以零剂量放行，请补全数据或修正后重核。</div>
+  {% else %}
+  <div class="msg err"><b>仅供回看，不能作为当前放行结论</b>：
+    {% if result.calc_status == 'failed' %}校时重算失败（{{ result.calc_status }}），
+    {% else %}校时尚未追平最新变更（数据代次领先已校代次），{% endif %}
+    以下为旧版校时 v{{ result.calc_version }} 的核算结果，待重算完成后请重新核算。</div>
+  {% endif %}
+  <p class="hint">
+    校时版本 v{{ result.calc_version }}　状态 {{ result.calc_status }}
+    {% if result.dirty %}<span class="warn">有变更待重算</span>{% else %}<span class="ok">校时已追平</span>{% endif %}
+    核算时间 {{ result.computed_at }}
+  </p>
+</div>
+
+{% if result.status == 'undetermined' %}
+<div class="card">
+  <h3>无法判定原因</h3>
+  {% for r in result.reasons %}
+  <div class="msg err">
+    <b>{{ r.message }}</b>
+    {% if r.gaps %}
+    <table>
+      <tr><th>起点读数</th><th>终点读数</th><th>间隔 (秒)</th></tr>
+      {% for g in r.gaps %}
+      <tr>
+        <td>批次 {{ g['from'].batch_id }} / 行 {{ g['from'].row_no }}（{{ g['from'].utc_time }}，{{ g['from'].temperature }}°C）</td>
+        <td>批次 {{ g.to.batch_id }} / 行 {{ g.to.row_no }}（{{ g.to.utc_time }}，{{ g.to.temperature }}°C）</td>
+        <td class="mono">{{ g.gap_seconds }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+    {% if r.conflicts %}
+    <table>
+      <tr><th>UTC</th><th>冲突读数（批次 / 行号 / 温度）</th></tr>
+      {% for group in r.conflicts %}
+      <tr>
+        <td class="mono">{{ group[0].utc_time }}</td>
+        <td>{% for p in group %}批次 {{ p.batch_id }} / 行 {{ p.row_no }} / {{ p.temperature }}°C{% if not loop.last %}；{% endif %}{% endfor %}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if result.status == 'ok' %}
+<div class="card">
+  <h3>剂量与依据{% if not result.current %}<span class="warn">（旧版，仅供回看）</span>{% endif %}</h3>
+  <p>
+    超温剂量：<b>{{ "%.3f"|format(result.dose) }}</b> °C·min　允许：{{ result.allowed }} °C·min
+    温度上限：{{ result.limit }} °C　使用读数：{{ result.points_used }} 点（同一校时版本 v{{ result.calc_version }}）
+  </p>
+
+  <h4>夹住时段首尾的读数（插值依据）</h4>
+  <table>
+    <tr><th>位置</th><th>批次号</th><th>原行号</th><th>段号</th><th>本地秒数</th>
+        <th>校时后 UTC</th><th>温度 (°C)</th></tr>
+    {% for pos, p in [('首端·前', result.window.start.before), ('首端·后', result.window.start.after),
+                      ('尾端·前', result.window.end.before), ('尾端·后', result.window.end.after)] %}
+    <tr>
+      <td>{{ pos }}</td><td>{{ p.batch_id }}</td><td>{{ p.row_no }}</td><td>{{ p.segment }}</td>
+      <td class="mono">{{ p.local_seconds }}</td><td class="mono">{{ p.utc_time }}</td>
+      <td>{{ p.temperature }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <h4>越界区间（{{ result.intervals|length }} 段）</h4>
+  {% if result.intervals %}
+  <table>
+    <tr><th>开始 UTC</th><th>结束 UTC</th><th>剂量 (°C·min)</th><th>峰值温度</th>
+        <th>首端读数（批次/行号）</th><th>尾端读数（批次/行号）</th><th>区间内越界读数</th></tr>
+    {% for iv in result.intervals %}
+    <tr>
+      <td class="mono">{{ iv.start_utc }}</td>
+      <td class="mono">{{ iv.end_utc }}</td>
+      <td>{{ "%.3f"|format(iv.dose) }}</td>
+      <td>{{ iv.peak_temperature }}°C（{{ iv.peak_utc }}）</td>
+      <td>批次 {{ iv.start_reading.batch_id }} / 行 {{ iv.start_reading.row_no }}
+          （{{ iv.start_reading.temperature }}°C）</td>
+      <td>批次 {{ iv.end_reading.batch_id }} / 行 {{ iv.end_reading.row_no }}
+          （{{ iv.end_reading.temperature }}°C）</td>
+      <td>{% for p in iv.exceed_readings %}批次 {{ p.batch_id }} / 行 {{ p.row_no }}（{{ p.temperature }}°C）{% if not loop.last %}；{% endif %}{% endfor %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="hint">时段内无越界区间（全程未超上限）。</p>
+  {% endif %}
+</div>
+{% endif %}
+{% endif %}
+{% endblock %}

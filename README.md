@@ -35,7 +35,18 @@ pytest -q                            # 运行自测
    **留存待校时**。**更正锚点必须提交所见版本**（乐观并发，版本不符返回 409）。
 3. **按日查询**（`/query`）：按 UTC 日期查看已校时读数，每行显示
    **批次号、原行号、锚点版本**、校时版本；页面下方列出待校时读数及原因。
-4. **处理状态**（`/`）：点数、重算状态（空闲/重算中/失败）、校时版本、
+4. **超温核算**（`/exposure`）：输入 UTC 起止、温度上限、允许的度·分钟剂量、
+   相邻读数最大间隔，核算运输时段的超温暴露，决定放行 / 隔离：
+   - 用**同一已发布校时版本**中夹住时段首尾的读数，按相邻点线性插值累计
+     超限面积（°C·min），跨日连续计算；
+   - 列出每段**越界区间**（起止 UTC、剂量、峰值）及**两端读数的批次号、原行号**，
+     并给出夹住时段首尾的插值依据读数；
+   - 首尾缺少可信读数、相邻间隔超限或同一 UTC 出现异温读数时返回
+     **「无法判定」，不得以零剂量放行**；
+   - 上传或更正锚点后若校时尚未追平（或重算失败），结果显示为
+     **「旧版，仅供回看」**，不能作为当前放行结论；剂量、依据与版号始终
+     对应同一完整校时结果。
+5. **处理状态**（`/`）：点数、重算状态（空闲/重算中/失败）、校时版本、
    数据代次、锚点与批次列表，可手动触发重算。
 
 ## 一致性设计
@@ -57,11 +68,30 @@ pytest -q                            # 运行自测
 | POST | `/api/uploads` | 上传 CSV（multipart `file`），返回 `{batch_id, accepted}` |
 | POST | `/api/anchors` | 录入/更正锚点 `{segment, local1, utc1, local2, utc2, version?}` |
 | GET | `/api/readings?date=YYYY-MM-DD` | 按 UTC 日查询已校时读数 |
+| GET | `/api/exposure?start&end&limit&allowed&max_gap` | 超温暴露核算（详见下节） |
 | GET | `/api/pending` | 待校时读数及原因 |
 | GET | `/api/status` | 点数、重算状态、代次、锚点、批次 |
 | POST | `/api/recalc` | 手动触发重算 |
 
 错误返回 `{detail, code, errors?, current_version?}`；锚点版本冲突为 409。
+
+### 超温核算返回结构
+
+`GET /api/exposure` 参数：`start`/`end`（UTC 时间）、`limit`（温度上限 °C）、
+`allowed`（允许剂量 °C·min）、`max_gap`（相邻读数最大间隔，分钟）。
+
+返回公共字段：`conclusion`（`release` 可放行 / `quarantine` 建议隔离 /
+`undetermined` 无法判定 / `stale` 旧版仅供回看）、`current`（校时已追平且无失败）、
+`calc_version`、`calc_status`、`dirty`、`computed_at`。
+
+- `status="ok"` 时另含：`dose`（°C·min，保留 6 位小数）、`decision`
+  （`release`/`quarantine`）、`window`（夹住时段首尾的读数）、`intervals`
+  （越界区间：起止 UTC、剂量、峰值、两端读数与区间内越界读数的批次号/原行号）。
+- `status="undetermined"` 时含 `reasons`（`NO_START_READING` /
+  `NO_END_READING` / `GAP_TOO_LARGE` / `CONFLICTING_READINGS`），
+  **不含 `dose`/`decision`**，调用方不得按零剂量放行。
+- 放行结论仅在 `current=true` 且 `conclusion=release` 时成立；
+  `stale` 表示校时未追平或重算失败，结果为旧版，仅供回看。
 
 ## 配置（环境变量）
 

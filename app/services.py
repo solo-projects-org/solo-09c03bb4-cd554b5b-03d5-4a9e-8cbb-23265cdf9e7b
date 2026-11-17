@@ -1,14 +1,16 @@
-"""领域服务：上传入库、锚点维护、查询、状态汇总。
+"""领域服务：上传入库、锚点维护、查询、超温核算、状态汇总。
 
 所有写操作在单事务内完成并递增 state_generation（触发后续重算）。
 """
 from __future__ import annotations
 
+import math
 from datetime import datetime
 
 from .config import Settings
 from .db import Database
-from .timeutil import fmt_utc, utcnow_iso
+from .dose import compute_dose
+from .timeutil import fmt_utc, parse_utc, utcnow_iso
 
 
 class ServiceError(Exception):
@@ -193,6 +195,122 @@ def query_by_date(db: Database, date_str: str) -> dict:
         "count": len(rows),
         "readings": [dict(r) for r in rows],
     }
+
+
+# ---------------------------------------------------------------- 超温核算
+
+def _parse_finite(value, label: str) -> float:
+    try:
+        x = float(str(value).strip())
+    except (TypeError, ValueError):
+        raise ServiceError(f"{label}须为数值", code="BAD_VALUE")
+    if not math.isfinite(x):
+        raise ServiceError(f"{label}须为有限数值", code="BAD_VALUE")
+    return x
+
+
+def compute_exposure(
+    db: Database,
+    start_raw: str,
+    end_raw: str,
+    limit_raw: str,
+    allowed_raw: str,
+    max_gap_raw: str,
+) -> dict:
+    """核算运输时段的超温暴露（度·分钟剂量），决定放行 / 隔离 / 无法判定。
+
+    一致性约定：
+    - 读数、校时版本、代次在同一一致快照内读取，剂量、依据与版号始终对应
+      同一完整结果；若快照内版本不一致（不应发生），返回无法判定而非拼凑结果。
+    - 校时未追平（dirty）或重算失败时，结果标记 current=False、conclusion="stale"：
+      旧版剂量仅供回看，不能作为当前放行结论，更不得误报可放行。
+    - 无法判定时不含 dose/decision 字段，不得以零剂量放行。
+    """
+    try:
+        start = parse_utc(start_raw)
+        end = parse_utc(end_raw)
+    except ValueError as exc:
+        raise ServiceError(str(exc), code="BAD_TIME")
+    if not start < end:
+        raise ServiceError("起始时间须早于结束时间", code="BAD_WINDOW")
+    limit = _parse_finite(limit_raw, "温度上限")
+    allowed = _parse_finite(allowed_raw, "允许剂量")
+    if allowed < 0:
+        raise ServiceError("允许剂量须为非负数值", code="BAD_VALUE")
+    max_gap_min = _parse_finite(max_gap_raw, "相邻读数最大间隔")
+    if max_gap_min <= 0:
+        raise ServiceError("相邻读数最大间隔须为正数（分钟）", code="BAD_VALUE")
+
+    def fn(conn):
+        calc = dict(conn.execute("SELECT * FROM calc_state WHERE id = 1").fetchone())
+        meta = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
+        rows = [dict(r) for r in conn.execute(
+            """
+            SELECT c.reading_id, c.utc_time, c.calc_version,
+                   r.batch_id, r.row_no, r.segment, r.local_seconds, r.temperature
+            FROM calibrated c JOIN readings r ON r.id = c.reading_id
+            ORDER BY c.utc_time, c.reading_id
+            """
+        )]
+        return calc, meta, rows
+
+    calc, meta, rows = db.snapshot(fn)
+    state_gen = int(meta.get("state_generation", "0"))
+    calibrated_gen = int(meta.get("calibrated_generation", "-1"))
+    dirty = state_gen != calibrated_gen
+    current = (not dirty) and calc["status"] != "failed"
+
+    points = []
+    versions = set()
+    for r in rows:
+        versions.add(r["calc_version"])
+        points.append({
+            "reading_id": r["reading_id"],
+            "batch_id": r["batch_id"],
+            "row_no": r["row_no"],
+            "segment": r["segment"],
+            "local_seconds": r["local_seconds"],
+            "utc_time": r["utc_time"],
+            "temperature": r["temperature"],
+            "ts": parse_utc(r["utc_time"]).timestamp(),
+        })
+
+    # 防御：快照内所有读数须同属当前已发布校时版本，否则不拼凑结果
+    version_consistent = versions <= {calc["version"]}
+    if version_consistent:
+        result = compute_dose(points, start.timestamp(), end.timestamp(),
+                              limit, max_gap_min * 60.0, allowed)
+    else:
+        result = {
+            "status": "undetermined",
+            "reasons": [{
+                "code": "VERSION_MIXED",
+                "message": "校时结果版本不一致（换版进行中），无法判定，请稍后重试",
+            }],
+        }
+
+    result.update({
+        "params": {
+            "start": fmt_utc(start),
+            "end": fmt_utc(end),
+            "limit": limit,
+            "allowed": allowed,
+            "max_gap_minutes": max_gap_min,
+        },
+        "calc_version": calc["version"],
+        "calc_status": calc["status"],
+        "dirty": dirty,
+        "current": current,
+        "computed_at": utcnow_iso(),
+    })
+    if not current:
+        # 校时未追平或重算失败：旧版剂量仅供回看，不能作为当前放行结论
+        result["conclusion"] = "stale"
+    elif result["status"] != "ok":
+        result["conclusion"] = "undetermined"
+    else:
+        result["conclusion"] = result["decision"]
+    return result
 
 
 def pending_readings(db: Database) -> list[dict]:

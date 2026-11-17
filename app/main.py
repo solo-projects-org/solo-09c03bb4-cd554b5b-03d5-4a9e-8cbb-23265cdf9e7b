@@ -155,6 +155,19 @@ def create_app() -> FastAPI:
                       pending=pending[:200], pending_count=len(pending),
                       calc=services.calc_info(db), msg="", ok=1)
 
+    @app.get("/exposure", response_class=HTMLResponse)
+    def exposure_page(request: Request, start: str = "", end: str = "",
+                      limit: str = "", allowed: str = "", max_gap: str = ""):
+        result, error = None, None
+        if all(x.strip() for x in (start, end, limit, allowed, max_gap)):
+            try:
+                result = services.compute_exposure(db, start, end, limit, allowed, max_gap)
+            except ServiceError as exc:
+                error = exc.message
+        return render(request, "exposure.html", result=result, error=error,
+                      form={"start": start, "end": end, "limit": limit,
+                            "allowed": allowed, "max_gap": max_gap}, msg="", ok=1)
+
     # ------------------------------------------------------------ JSON API
 
     @app.get("/api/status")
@@ -207,6 +220,14 @@ def create_app() -> FastAPI:
     def api_readings(date: str):
         try:
             return services.query_by_date(db, date)
+        except ServiceError as exc:
+            return error_json(exc)
+
+    @app.get("/api/exposure")
+    def api_exposure(start: str = "", end: str = "", limit: str = "",
+                     allowed: str = "", max_gap: str = ""):
+        try:
+            return services.compute_exposure(db, start, end, limit, allowed, max_gap)
         except ServiceError as exc:
             return error_json(exc)
 
